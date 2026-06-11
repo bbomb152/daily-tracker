@@ -55,6 +55,33 @@
     border-color: var(--guitar);
     color: var(--guitar);
   }
+  .demo-btn.err {
+    background: #3a1518;
+    border-color: var(--gym);
+    color: var(--gym);
+  }
+  .sync-row { display: flex; gap: 8px; margin-top: 10px; }
+  .sync-row input {
+    flex: 1;
+    min-width: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+  .sync-row button {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .sync-steps { margin: 8px 0 0; padding-left: 20px; }
+  .sync-steps li { margin-bottom: 6px; }
   .demo-banner {
     margin: 0 18px 4px;
     padding: 8px 12px;
@@ -254,6 +281,7 @@
 <body>
 <header>
   <h1>Habits</h1>
+  <button class="demo-btn" id="syncPill" hidden title="Cloud sync status — tap to sync now">☁️</button>
   <button class="demo-btn" id="demoToggle">Demo: off</button>
 </header>
 <div id="demoBanner" class="demo-banner" hidden>Viewing demo data — your real data is safe</div>
@@ -322,8 +350,10 @@ function getEntry(dateStr) {
   return data.entries[dateStr] || { guitar: false, guitarMins: 0, gym: false, shake: false, productive: false };
 }
 function setEntry(dateStr, entry) {
+  entry.ts = Date.now(); // per-day edit time, used to resolve sync conflicts
   data.entries[dateStr] = entry;
   saveData(data);
+  if (!demoMode) schedulePush();
 }
 function isDone(entry, habitId) {
   if (habitId === "guitar") return !!entry.guitar || (entry.guitarMins || 0) > 0;
@@ -375,6 +405,187 @@ function setDemoMode(on) {
   currentDate = today();
   renderChrome();
   render();
+}
+
+// ---------- Cloud sync (secret GitHub Gist) ----------
+// The log lives in a secret Gist in the user's GitHub account, found by its
+// description marker. Sync = pull, merge per-day by newest ts, push if local
+// had anything newer. Demo data never syncs.
+const SYNC_TOKEN_KEY = "habitlog.sync.token";
+const SYNC_GIST_KEY = "habitlog.sync.gist";
+const GIST_MARKER = "habit-tracker-sync-v1";
+const GIST_FILE = "habits.json";
+
+let syncToken = localStorage.getItem(SYNC_TOKEN_KEY) || "";
+let gistId = localStorage.getItem(SYNC_GIST_KEY) || "";
+let syncState = "idle";   // idle | syncing | synced | error
+let syncMsg = "";
+let lastSyncAt = 0;
+let pushTimer = null;
+let syncBusy = false;
+let syncQueued = false;
+
+async function ghApi(method, path, body) {
+  const res = await fetch("https://api.github.com" + path, {
+    method,
+    headers: {
+      "Authorization": "Bearer " + syncToken,
+      "Accept": "application/vnd.github+json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    keepalive: true,
+  });
+  if (!res.ok) {
+    const err = new Error("GitHub API " + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+// Sync always operates on the REAL store, even while demo mode is showing.
+function realData() {
+  if (!demoMode) return data;
+  try {
+    const raw = localStorage.getItem(REAL_KEY);
+    const o = raw ? JSON.parse(raw) : null;
+    if (o && typeof o.entries === "object") return o;
+  } catch (e) { /* fresh */ }
+  return { entries: {} };
+}
+function saveRealData(d) {
+  if (!demoMode) { data = d; saveData(data); }
+  else localStorage.setItem(REAL_KEY, JSON.stringify(d));
+}
+
+function mergeEntries(local, remote) {
+  const merged = { entries: {} };
+  let localNewer = false, localChanged = false;
+  const dates = new Set([...Object.keys(local.entries), ...Object.keys(remote.entries)]);
+  for (const day of dates) {
+    const l = local.entries[day], r = remote.entries[day];
+    if (l && r) {
+      const same = JSON.stringify(l) === JSON.stringify(r);
+      const pick = (r.ts || 0) > (l.ts || 0) ? r : l;
+      merged.entries[day] = pick;
+      if (!same) { if (pick === l) localNewer = true; else localChanged = true; }
+    } else if (l) { merged.entries[day] = l; localNewer = true; }
+    else { merged.entries[day] = r; localChanged = true; }
+  }
+  return { merged, localNewer, localChanged };
+}
+
+async function findOrCreateGist() {
+  if (gistId) return gistId;
+  const gists = await ghApi("GET", "/gists?per_page=100");
+  const mine = gists.find(g => g.description === GIST_MARKER && g.files && g.files[GIST_FILE]);
+  if (mine) {
+    gistId = mine.id;
+  } else {
+    const created = await ghApi("POST", "/gists", {
+      description: GIST_MARKER,
+      public: false,
+      files: { [GIST_FILE]: { content: JSON.stringify(realData()) } },
+    });
+    gistId = created.id;
+  }
+  localStorage.setItem(SYNC_GIST_KEY, gistId);
+  return gistId;
+}
+
+// replace=true overwrites the cloud with local as-is (clear / import).
+async function syncNow(replace = false) {
+  if (!syncToken) return;
+  if (syncBusy) { syncQueued = true; return; }
+  syncBusy = true;
+  setSyncState("syncing");
+  try {
+    const hadGist = !!gistId;
+    await findOrCreateGist();
+    let local = realData();
+    let needPush = replace || !hadGist;
+    if (!replace && hadGist) {
+      const g = await ghApi("GET", "/gists/" + gistId);
+      const f = g.files && g.files[GIST_FILE];
+      let remote = { entries: {} };
+      if (f) {
+        try {
+          const content = f.truncated ? await (await fetch(f.raw_url)).text() : f.content;
+          const o = JSON.parse(content);
+          if (o && typeof o.entries === "object") remote = o;
+        } catch (e) { /* corrupt remote: treat as empty, local wins */ }
+      }
+      const { merged, localNewer, localChanged } = mergeEntries(local, remote);
+      local = merged;
+      if (localChanged) {
+        saveRealData(merged);
+        if (!demoMode) render();
+      }
+      needPush = localNewer;
+    }
+    if (needPush) {
+      await ghApi("PATCH", "/gists/" + gistId, {
+        files: { [GIST_FILE]: { content: JSON.stringify(local) } },
+      });
+    }
+    lastSyncAt = Date.now();
+    setSyncState("synced");
+  } catch (e) {
+    if (e.status === 401) {
+      setSyncState("error", "GitHub rejected the token — it may be expired or revoked");
+    } else if ((e.status === 403 || e.status === 404) && !gistId) {
+      setSyncState("error", "Token can't access gists — use a classic token with the gist scope");
+    } else if (e.status === 404 && gistId) {
+      gistId = "";
+      localStorage.removeItem(SYNC_GIST_KEY);
+      setSyncState("error", "Sync gist was deleted — it will be recreated on the next sync");
+    } else {
+      setSyncState("error", navigator.onLine ? "Sync failed — will retry" : "Offline — will sync when back online");
+    }
+  } finally {
+    syncBusy = false;
+    if (syncQueued) { syncQueued = false; syncNow(); }
+  }
+}
+
+function schedulePush() {
+  if (!syncToken || demoMode) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => { pushTimer = null; syncNow(); }, 1200);
+}
+
+function setSyncState(s, msg) {
+  syncState = s;
+  syncMsg = msg || "";
+  const pill = document.getElementById("syncPill");
+  pill.hidden = !syncToken;
+  if (syncToken) {
+    pill.textContent = s === "syncing" ? "☁️ syncing" : s === "error" ? "☁️ !" : "☁️ ✓";
+    pill.classList.toggle("err", s === "error");
+  }
+  const status = document.getElementById("syncStatus");
+  if (status) status.textContent = syncStatusText();
+}
+
+function syncStatusText() {
+  if (!syncToken) return syncMsg || "";
+  if (syncState === "syncing") return "Syncing…";
+  if (syncState === "error") return "⚠️ " + syncMsg;
+  if (lastSyncAt) {
+    return "Synced ✓ " + new Date(lastSyncAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  return "Connected — waiting for first sync";
+}
+
+function disconnectSync() {
+  syncToken = "";
+  gistId = "";
+  localStorage.removeItem(SYNC_TOKEN_KEY);
+  localStorage.removeItem(SYNC_GIST_KEY);
+  clearTimeout(pushTimer);
+  pushTimer = null;
+  setSyncState("idle");
 }
 
 // ---------- Stats helpers ----------
@@ -601,10 +812,38 @@ function renderStats() {
 
 function renderData() {
   const count = Object.keys(data.entries).length;
+  const syncCard = syncToken ? `
+    <h2>Cloud sync</h2>
+    <div class="card" style="font-size:14px">
+      <div>Cloud sync is <b>on</b> — your log is saved to a secret Gist in your GitHub account
+      and shared by every device you connect.</div>
+      <p class="hint" id="syncStatus">${syncStatusText()}</p>
+      <div class="data-actions">
+        <button id="syncNowBtn">🔄 Sync now</button>
+        <button id="disconnectBtn" class="danger">Disconnect sync</button>
+      </div>
+    </div>` : `
+    <h2>Cloud sync</h2>
+    <div class="card" style="font-size:14px">
+      <div>Sync your log across devices via a secret Gist in your GitHub account. One-time setup:</div>
+      <ol class="sync-steps hint">
+        <li><a href="https://github.com/settings/tokens/new?scopes=gist&description=Habit+Tracker+Sync"
+          target="_blank" rel="noopener">Create a GitHub token</a> — keep the pre-selected
+          <b>gist</b> scope, set Expiration to <b>No expiration</b>, then Generate.</li>
+        <li>Copy the <code>ghp_…</code> token and paste it below. Do this once on each device.</li>
+      </ol>
+      <div class="sync-row">
+        <input id="tokenInput" type="password" placeholder="ghp_…" autocomplete="off" spellcheck="false">
+        <button id="connectBtn">Connect</button>
+      </div>
+      <p class="hint" id="syncStatus">${syncStatusText()}</p>
+    </div>`;
   view.innerHTML = `
+    ${syncCard}
     <h2>Your data</h2>
     <div class="card" style="font-size:14px;color:var(--text-dim)">
-      ${count} day${count === 1 ? "" : "s"} logged${demoMode ? " (demo)" : ""} · stored locally in this browser
+      ${count} day${count === 1 ? "" : "s"} logged${demoMode ? " (demo)" : ""} ·
+      ${syncToken && !demoMode ? "synced to GitHub + stored in this browser" : "stored locally in this browser"}
     </div>
     <div class="data-actions">
       <button id="exportBtn">⬇️ Export data (JSON)</button>
@@ -612,8 +851,37 @@ function renderData() {
       <input type="file" id="importFile" accept=".json,application/json" hidden>
       <button id="clearBtn" class="danger">🗑️ Clear ${demoMode ? "demo" : "all"} data</button>
     </div>
-    <p class="hint">Data lives in this browser's localStorage, so your phone and computer each keep
-    their own log. Use export/import to move history between devices.</p>`;
+    <p class="hint">${syncToken
+      ? "A local copy lives in this browser; cloud sync keeps every connected device on the same log."
+      : "Data lives in this browser's localStorage, so your phone and computer each keep their own log. Connect cloud sync above to share one log everywhere."}</p>`;
+
+  if (syncToken) {
+    document.getElementById("syncNowBtn").onclick = () => syncNow();
+    document.getElementById("disconnectBtn").onclick = () => {
+      if (!confirm("Disconnect cloud sync on this device? Your data stays here and in the cloud; this device just stops syncing.")) return;
+      disconnectSync();
+      render();
+    };
+  } else {
+    const tokenInput = document.getElementById("tokenInput");
+    document.getElementById("connectBtn").onclick = async () => {
+      const t = tokenInput.value.trim();
+      if (!t) { tokenInput.focus(); return; }
+      syncToken = t;
+      setSyncState("syncing");
+      try {
+        await ghApi("GET", "/user");
+        localStorage.setItem(SYNC_TOKEN_KEY, t);
+        await syncNow();
+        render();
+      } catch (e) {
+        syncToken = "";
+        setSyncState("idle", "⚠️ GitHub rejected that token — check it was copied fully and has the gist scope");
+        const status = document.getElementById("syncStatus");
+        if (status) status.textContent = syncMsg;
+      }
+    };
+  }
 
   document.getElementById("exportBtn").onclick = () => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -634,6 +902,7 @@ function renderData() {
         if (!obj || typeof obj.entries !== "object") throw new Error("bad shape");
         data = obj;
         saveData(data);
+        if (!demoMode && syncToken) syncNow(true); // imported file becomes the cloud copy too
         render();
       } catch (e) {
         alert("That file doesn't look like a habits export.");
@@ -642,9 +911,11 @@ function renderData() {
     reader.readAsText(file);
   };
   document.getElementById("clearBtn").onclick = () => {
-    if (!confirm(`Delete ${demoMode ? "demo" : "ALL"} habit data? This can't be undone.`)) return;
+    const where = demoMode ? "demo" : (syncToken ? "ALL (this device AND the cloud copy)" : "ALL");
+    if (!confirm(`Delete ${where} habit data? This can't be undone.`)) return;
     localStorage.removeItem(storageKey());
     data = loadData();
+    if (!demoMode && syncToken) syncNow(true); // clear the cloud copy as well
     render();
   };
 }
@@ -658,9 +929,21 @@ document.querySelectorAll("nav.tabs button").forEach(btn => {
   });
 });
 document.getElementById("demoToggle").addEventListener("click", () => setDemoMode(!demoMode));
+document.getElementById("syncPill").addEventListener("click", () => syncNow());
+
+// Pull fresh data whenever the app comes back to the foreground (e.g. phone
+// reopens the PWA); flush any pending edit when it goes to the background.
+document.addEventListener("visibilitychange", () => {
+  if (!syncToken) return;
+  if (document.visibilityState === "visible") syncNow();
+  else if (pushTimer) { clearTimeout(pushTimer); pushTimer = null; syncNow(); }
+});
+window.addEventListener("online", () => { if (syncToken) syncNow(); });
 
 renderChrome();
 render();
+setSyncState(syncState);
+if (syncToken) syncNow();
 
 if ("serviceWorker" in navigator && location.protocol !== "file:") {
   navigator.serviceWorker.register("sw.js").catch(() => {});
