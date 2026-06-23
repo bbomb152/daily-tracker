@@ -19,6 +19,8 @@
     --gym: #ff5d5d;
     --shake: #4cd97b;
     --productive: #5da9ff;
+    --stretch: #b07cff;
+    --intake: #46d6c8;
     --accent: #5da9ff;
     --radius: 14px;
   }
@@ -156,6 +158,7 @@
   .habit-row.done[data-habit="gym"] .check { background: var(--gym); border-color: var(--gym); }
   .habit-row.done[data-habit="shake"] .check { background: var(--shake); border-color: var(--shake); }
   .habit-row.done[data-habit="productive"] .check { background: var(--productive); border-color: var(--productive); }
+  .habit-row.done[data-habit="stretch"] .check { background: var(--stretch); border-color: var(--stretch); }
   .minutes-panel {
     display: flex;
     align-items: center;
@@ -226,6 +229,7 @@
   .hm-2 { background: #20683f; }
   .hm-3 { background: #2fa45c; }
   .hm-4 { background: #4cd97b; }
+  .hm-5 { background: #6ef09a; }
   .heatmap-legend {
     display: flex; align-items: center; gap: 4px;
     font-size: 11.5px; color: var(--text-dim);
@@ -252,6 +256,63 @@
   }
   .data-actions button.danger { color: var(--gym); border-color: #4a2c2c; }
   .hint { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; margin-top: 14px; }
+  /* ---------- Intake ---------- */
+  .intake-total {
+    text-align: center;
+    padding: 22px 16px 24px;
+  }
+  .intake-total .num {
+    font-size: 56px;
+    font-weight: 700;
+    color: var(--intake);
+    line-height: 1;
+  }
+  .intake-total .unit { font-size: 22px; color: var(--text-dim); font-weight: 600; }
+  .intake-total .sub { font-size: 13px; color: var(--text-dim); margin-top: 8px; }
+  .intake-add {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+  .intake-add button {
+    background: var(--intake);
+    color: #06201d;
+    border: none;
+    border-radius: 14px;
+    padding: 20px 0;
+    font-size: 22px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .intake-add button:active { filter: brightness(0.9); }
+  .intake-undo {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+  }
+  .intake-undo button {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    border-radius: 12px;
+    padding: 11px 0;
+    font-size: 15px;
+    cursor: pointer;
+  }
+  .intake-undo button:disabled { opacity: 0.35; }
+  .intake-list { list-style: none; }
+  .intake-list li {
+    display: flex;
+    justify-content: space-between;
+    padding: 9px 2px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  .intake-list li:last-child { border-bottom: none; }
+  .intake-list .amt { color: var(--intake); font-weight: 600; }
+  .intake-list .none { color: var(--text-dim); }
   /* ---------- Tabs ---------- */
   nav.tabs {
     position: fixed;
@@ -288,6 +349,7 @@
 <main id="view"></main>
 <nav class="tabs">
   <button data-tab="today" class="active"><span class="ico">☑️</span>Today</button>
+  <button data-tab="intake"><span class="ico">💧</span>Intake</button>
   <button data-tab="stats"><span class="ico">📈</span>Stats</button>
   <button data-tab="data"><span class="ico">⚙️</span>Data</button>
 </nav>
@@ -301,7 +363,9 @@ const HABITS = [
   { id: "gym",        name: "Go to the gym",    icon: "🏋️", color: "var(--gym)",        hex: "#ff5d5d" },
   { id: "shake",      name: "Protein shake",    icon: "🥤", color: "var(--shake)",      hex: "#4cd97b" },
   { id: "productive", name: "Did something productive", icon: "✅", color: "var(--productive)", hex: "#5da9ff" },
+  { id: "stretch",    name: "Stretching",        icon: "🧘", color: "var(--stretch)",    hex: "#b07cff" },
 ];
+const INTAKE_UNIT = "mg";
 const REAL_KEY = "habitlog.v1";
 const DEMO_KEY = "habitlog.demo.v1";
 const DEMO_FLAG = "habitlog.demoMode";
@@ -347,7 +411,7 @@ function saveData(data) {
 let data = loadData();
 
 function getEntry(dateStr) {
-  return data.entries[dateStr] || { guitar: false, guitarMins: 0, gym: false, shake: false, productive: false };
+  return data.entries[dateStr] || { guitar: false, guitarMins: 0, gym: false, shake: false, productive: false, stretch: false, intake: 0 };
 }
 function setEntry(dateStr, entry) {
   entry.ts = Date.now(); // per-day edit time, used to resolve sync conflicts
@@ -376,7 +440,7 @@ function generateDemoData() {
   let d = start;
   while (d <= today()) {
     const dow = parse(d).getDay(); // 0 = Sunday
-    const e = { guitar: false, guitarMins: 0, gym: false, shake: false, productive: false };
+    const e = { guitar: false, guitarMins: 0, gym: false, shake: false, productive: false, stretch: false, intake: 0 };
     // Guitar: ~70% of days, more on weekends, 15–60 min
     if (rng() < (dow === 0 || dow === 6 ? 0.85 : 0.65)) {
       e.guitar = true;
@@ -389,6 +453,10 @@ function generateDemoData() {
     if (e.gym ? rng() < 0.92 : rng() < 0.25) e.shake = true;
     // Productive: ~80%, slightly lower on Sundays
     if (rng() < (dow === 0 ? 0.6 : 0.82)) e.productive = true;
+    // Stretching: often after the gym, sometimes on its own (~55%)
+    if (e.gym ? rng() < 0.7 : rng() < 0.45) e.stretch = true;
+    // Intake: a few doses most days, in multiples of 3
+    e.intake = [0, 0, 3, 6, 6, 9, 9, 12][Math.floor(rng() * 8)];
     entries[d] = e;
     d = addDays(d, 1);
   }
@@ -648,6 +716,7 @@ function renderChrome() {
 
 function render() {
   if (activeTab === "today") renderToday();
+  else if (activeTab === "intake") renderIntake();
   else if (activeTab === "stats") renderStats();
   else renderData();
 }
@@ -740,6 +809,89 @@ function renderToday() {
   });
 }
 
+function renderIntake() {
+  const entry = getEntry(currentDate);
+  const total = entry.intake || 0;
+  const d = parse(currentDate);
+  const isToday = currentDate === today();
+  const dayLabel = isToday ? "Today" : d.toLocaleDateString(undefined, { weekday: "long" });
+  const subLabel = d.toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
+
+  // Last 14 days history (newest first), with mini bars
+  const days = [];
+  let maxDay = 0;
+  for (let i = 0; i < 14; i++) {
+    const day = addDays(today(), -i);
+    const amt = getEntry(day).intake || 0;
+    if (amt > maxDay) maxDay = amt;
+    days.push({ day, amt });
+  }
+  const last7 = days.slice(0, 7).reduce((s, x) => s + x.amt, 0);
+
+  let history = "";
+  for (const { day, amt } of days) {
+    const pd = parse(day);
+    const lbl = day === today() ? "Today"
+      : day === addDays(today(), -1) ? "Yesterday"
+      : pd.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const w = maxDay > 0 ? Math.round((amt / maxDay) * 100) : 0;
+    history += `<li>
+      <span>${lbl}</span>
+      <span style="flex:1;margin:0 12px;height:8px;border-radius:99px;background:var(--surface-2);overflow:hidden">
+        <span style="display:block;height:100%;width:${w}%;background:var(--intake)"></span></span>
+      <span class="${amt > 0 ? "amt" : "none"}">${amt} ${INTAKE_UNIT}</span>
+    </li>`;
+  }
+
+  view.innerHTML = `
+    <div class="datebar">
+      <button id="prevDay" aria-label="Previous day">‹</button>
+      <div class="label"><div class="day">${dayLabel}</div><div class="sub">${subLabel}</div></div>
+      <button id="nextDay" aria-label="Next day" ${isToday ? "disabled" : ""}>›</button>
+    </div>
+    <div class="card">
+      <div class="intake-total">
+        <div><span class="num">${total}</span> <span class="unit">${INTAKE_UNIT}</span></div>
+        <div class="sub">${isToday ? "total today" : "total this day"}</div>
+      </div>
+      <div class="intake-add">
+        <button data-add="3">+3</button>
+        <button data-add="6">+6</button>
+      </div>
+      <div class="intake-undo">
+        <button data-add="-3" ${total < 3 ? "disabled" : ""}>−3</button>
+        <button data-add="-6" ${total < 6 ? "disabled" : ""}>−6</button>
+        <button id="intakeReset" ${total === 0 ? "disabled" : ""}>Reset</button>
+      </div>
+    </div>
+    <h2>Last 7 days</h2>
+    <div class="card" style="font-size:14px;color:var(--text-dim)">
+      ${last7} ${INTAKE_UNIT} total · avg ${(last7 / 7).toFixed(1)} ${INTAKE_UNIT}/day
+    </div>
+    <h2>History</h2>
+    <div class="card"><ul class="intake-list">${history}</ul></div>`;
+
+  document.getElementById("prevDay").onclick = () => { currentDate = addDays(currentDate, -1); render(); };
+  const next = document.getElementById("nextDay");
+  if (next) next.onclick = () => { if (currentDate < today()) { currentDate = addDays(currentDate, 1); render(); } };
+
+  function bump(delta) {
+    const e = getEntry(currentDate);
+    e.intake = Math.max(0, (e.intake || 0) + delta);
+    setEntry(currentDate, e);
+    render();
+  }
+  view.querySelectorAll("[data-add]").forEach(btn => {
+    btn.addEventListener("click", () => bump(Number(btn.dataset.add)));
+  });
+  document.getElementById("intakeReset").onclick = () => {
+    const e = getEntry(currentDate);
+    e.intake = 0;
+    setEntry(currentDate, e);
+    render();
+  };
+}
+
 function renderStats() {
   let html = `<h2>Streaks</h2><div class="streak-grid">`;
   for (const h of HABITS) {
@@ -766,13 +918,13 @@ function renderStats() {
       if (day > today()) { html += `<div class="heatmap-cell" style="background:transparent"></div>`; continue; }
       const e = getEntry(day);
       const n = HABITS.filter(h => isDone(e, h.id)).length;
-      html += `<div class="heatmap-cell ${n > 0 ? "hm-" + n : ""}" title="${day}: ${n}/4"></div>`;
+      html += `<div class="heatmap-cell ${n > 0 ? "hm-" + n : ""}" title="${day}: ${n}/${HABITS.length}"></div>`;
     }
   }
   html += `</div></div>
     <div class="heatmap-legend">0
-      <span class="heatmap-cell"></span><span class="heatmap-cell hm-1"></span><span class="heatmap-cell hm-2"></span><span class="heatmap-cell hm-3"></span><span class="heatmap-cell hm-4"></span>
-    4 habits</div></div>`;
+      <span class="heatmap-cell"></span><span class="heatmap-cell hm-1"></span><span class="heatmap-cell hm-2"></span><span class="heatmap-cell hm-3"></span><span class="heatmap-cell hm-4"></span><span class="heatmap-cell hm-5"></span>
+    ${HABITS.length} habits</div></div>`;
 
   // Guitar minutes per week (SVG bar chart, last 8 weeks)
   const weeks = weeklyGuitarMinutes(8);
